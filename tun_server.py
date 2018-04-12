@@ -18,7 +18,7 @@ CUSTOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345678
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-d", "--domain", action="store",default="localhost", help="domain this server services")
+parser.add_argument("-d", "--domain", action="store",required=1, help="domain this server services")
 parser.add_argument("-p", "--port", action="store",default=53, help="dns server port number")
 parser.add_argument("-r", "--respcnt", action="store",default=10, help="dns entries per query response")
 parser.add_argument("-f", "--filedir", action="store",default="files", help="file transfer directory")
@@ -79,18 +79,6 @@ def dns_response(request):
 					s['sock'].close()
 					sesssions[n]
 
-		elif splitstring[0] == "filelen":
-			debuglog("filelen")
-			tdata = splitstring[1]
-			needs_padding = len(tdata) % 4
-			if needs_padding:
-				tdata += b'='* (4 - needs_padding)
-			data = base64.b64decode(tdata.translate(DECODE_TRANS))
-			size = os.path.getsize(FILE_TRANSFER_DIR+os.path.sep+data)
-			size_ip = socket.inet_ntoa(struct.pack('>I', size))
-			reply.add_answer(RR(rname=qname, rtype=QTYPE.A, rclass=1, ttl=TTL, rdata=A(size_ip)))
-			replycount += 1
-
 		elif splitstring[0] == "sf":
 			debuglog("simple file")
 			tdata = splitstring[2]
@@ -110,7 +98,7 @@ def dns_response(request):
 			replycount += 1
 			f.close()
 
-		elif splitstring[0] == "file":
+		elif splitstring[0] == "f":
 			print "file"
 			tdata = splitstring[1]
 			offset = int(splitstring[2])
