@@ -213,9 +213,10 @@ class BaseRequestHandler(SocketServer.BaseRequestHandler):
 				answers = []
 				if len(simplecmd) <= 2:
 					if simplecmd == "sf":
-						debuglog(DEBUG_LEVEL_NORMAL,"simple file")
+						splitstring = tdata[1:].split(".")
 						tdata = splitstring[2]
 						offset = int(splitstring[1])
+						debuglog(DEBUG_LEVEL_NORMAL,"\'simple\' file request  \"%s\" @ 0x%08x" % (FILE_TRANSFER_DIR+os.path.sep+os.path.basename(tdata), offset))
 						try:
 							f = open(FILE_TRANSFER_DIR+os.path.sep+os.path.basename(tdata))
 							f.seek(offset, 0)
@@ -223,35 +224,43 @@ class BaseRequestHandler(SocketServer.BaseRequestHandler):
 							for e in xrange(3):
 								data |= (ord(f.read(1)) << (16 - (8 * e)))
 								data |= e << 28;
-						except:
-							data = 0
-			
-						data_ip = socket.inet_ntoa(struct.pack('>I', data))
-						answers.append(data_ip)
+							data_ip = socket.inet_ntoa(struct.pack('>I', data))
+							answers.append(data_ip)
+						except IOError:
+							debuglog(DEBUG_LEVEL_NORMAL, "could not open requested file \"%s\"" %  FILE_TRANSFER_DIR+os.path.sep+os.path.basename(data))
+							answers.append("0.0.0.0")
+
 						f.close()
 			
 					elif simplecmd == "f":
-						debuglog(DEBUG_LEVEL_NORMAL,"file");
+						splitstring = tdata[1:].split(".")
 						tdata = splitstring[1]
 						offset = int(splitstring[2])
 						needs_padding = len(tdata) % 4
 						if needs_padding:
 							tdata += b'='* (4 - needs_padding)
 						data = base64.b64decode(tdata.translate(DECODE_TRANS))
-						f = open(FILE_TRANSFER_DIR+os.path.sep+os.path.basename(data))
-						f.seek(offset, 0)
-						for i in xrange(DNS_RESPONSES_PER_REQUEST):
-							data = ((i & 0x0f) << 24)
-							try:
-								for e in xrange(3):
-									data |= (ord(f.read(1)) << (16 - (8 * e)))
-									data |= e << 28;
-							except:
-								print "fixme"
-							data_ip = socket.inet_ntoa(struct.pack('>I', data))
-							answers.append(data_ip)
-						f.close()
-							
+						debuglog(DEBUG_LEVEL_NORMAL,"file request: \"%s\" @ 0x%08x"  % (FILE_TRANSFER_DIR+os.path.sep+os.path.basename(data), offset));
+						try:
+							f = open(FILE_TRANSFER_DIR+os.path.sep+os.path.basename(data))
+							f.seek(offset, 0)
+							for i in xrange(DNS_RESPONSES_PER_REQUEST):
+								data = ((i & 0x0f) << 24)
+								try:
+									for e in xrange(3):
+										data |= (ord(f.read(1)) << (16 - (8 * e)))
+										data |= e << 28;
+								except:
+									print "fixme"
+								data_ip = socket.inet_ntoa(struct.pack('>I', data))
+								answers.append(data_ip)
+							f.close()
+						except IOError:
+							debuglog(DEBUG_LEVEL_NORMAL, "could not open requested file \"%s\"" %  FILE_TRANSFER_DIR+os.path.sep+os.path.basename(data))
+							answers.append("0.0.0.0")
+
+
+
 				else:
 					tdata = "".join(tdata[1:].split("."))
 					needs_padding = len(tdata) % 4
