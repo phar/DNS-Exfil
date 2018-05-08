@@ -14,18 +14,11 @@
 
 
 
-static const unsigned char base64_table[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+static const unsigned char BASE64_ALPHABET[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+char SIMPLE_ALPHABET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 
-uint8_t lfsr_taps4[] = {0xF, (1 << 3), (1 << 2), 0};
-uint8_t lfsr_taps8[] = {0xFF, (1 << 7), (1 << 5), (1 << 4), (1 << 3), 0};
-uint16_t lfsr_taps12[] = {0xFFF, (1 << 11), (1 << 5), (1 << 3), (1 << 0), 0};
-uint16_t lfsr_taps16[] = {0xFFFF, (1 << 15), (1 << 14), (1 << 12), (1 << 3), 0};
-uint32_t lfsr_taps20[] = {0xFFFFF, (1 << 19), (1 << 16), 0};
-uint32_t lfsr_taps24[] = {0xFFFFFF, (1 << 23), (1 << 22), (1 << 21), (1 << 16), 0};
-uint32_t lfsr_taps28[] = {0xFFFFFFF, (1 << 27), (1 << 24), 0};
 uint32_t lfsr_taps32[] = {0xFFFFFFFF, (1 << 31), (1 << 21), (1 << 1), (1 << 0), 0};
-
 
 server_t Server;
 
@@ -94,17 +87,25 @@ uint8_t outbuff[CLIENT_WRITE_CHUNK_SIZE];
 		fds[0].fd = Server.server_fd;
 		fds[0].events = POLLIN;
 		
-		for(t = Server.phead,fdc=1;(t != NULL) && (fdc < MAX_SOCKET_COUNT);t=t->pnext,fdc+=1){
-			fds[fdc].fd = t->to_client_sock;
-			fds[fdc].events = POLLIN  | POLLERR  |POLLHUP;
-			if((t->more_data_waiting== 1) | fifo_has_data(&t->to_serv_fifo) | fifo_has_data(&t->to_client_fifo) | (t->last_heard < (time(NULL) - 1))){
-				t->more_data_waiting= 0;
-				pump_data(t);
-			}
-			
-			if(fifo_has_data(&t->to_client_fifo)){
-				fifo_pop(&t->to_client_fifo,outbuff,&outbufflen);
-				send(t->to_client_sock, outbuff, outbufflen, 0);
+		for(t = Server.phead,fdc=1;(t != NULL) && (fdc < MAX_SOCKET_COUNT);t=t->pnext){
+			if (t->active){
+				fds[fdc].fd = t->to_client_sock;
+				fds[fdc].events = POLLIN  | POLLERR  |POLLHUP;
+				if((t->more_data_waiting== 1) | fifo_has_data(t->to_serv_fifo) | fifo_has_data(t->to_client_fifo) | (t->last_heard < (time(NULL) - 1))){
+					t->more_data_waiting= 0;
+					if(pump_data(t) < 0){ //error condition
+						tun_shutdown(t);
+					}
+				}
+				
+				if(fifo_has_data(t->to_client_fifo)){
+					if((fifo_pop(t->to_client_fifo,outbuff,&outbufflen)) != -1){
+						send(t->to_client_sock, outbuff, outbufflen, 0);
+					}else{
+						tun_shutdown(t);
+					}
+				}
+				fdc+=1;
 			}
 		}
 		
@@ -115,9 +116,13 @@ uint8_t outbuff[CLIENT_WRITE_CHUNK_SIZE];
 
 			if(fdc < MAX_SOCKET_COUNT){
 				if ((s = accept(Server.server_fd, (struct sockaddr *) &client, &client_len))){
-					tun = tun_new(&Server,s);
-					debuglog(PRIORITY_DEBUG_NORMAL,"tunnel client connect on socket %d", s);
-					tun_connect(tun);
+					if((tun = tun_new(&Server,s))){
+						tun_new_session(tun); //fixme error handling
+						tun_connect(tun);
+						debuglog(PRIORITY_DEBUG_NORMAL,"tunnel client connect on socket %d", s);
+					}else{
+						debuglog(PRIORITY_DEBUG_NORMAL,"tunnel client connect failed due to memory issue");
+					}
 				}else{
 					debuglog(PRIORITY_DEBUG_NORMAL,"tunnel client connect failed!", s);
 				}
@@ -132,21 +137,19 @@ uint8_t outbuff[CLIENT_WRITE_CHUNK_SIZE];
 					if(fds[i].fd == t->to_client_sock){
 						if (fds[i].revents & (POLLERR | POLLHUP)) {
 							debuglog(PRIORITY_DEBUG_NORMAL,"socket error");
-							tun_close(t);
-							break;
+							tun_shutdown(t);
 						}else{
 							if (fds[i].revents & POLLIN) {
 								if((readlen = recv(fds[i].fd, inbuff, CLIENT_READ_CHUNK_SIZE, 0)) == -1){
-									tun_close(t);
-									break;
+									debuglog(PRIORITY_DEBUG_NORMAL,"tunnel client connect failed due to memory issue");
+									tun_shutdown(t);
 								}else{
-									fifo_push(&t->to_serv_fifo, inbuff, readlen);
+									if((fifo_push(t->to_serv_fifo, inbuff, readlen)) == -1){
+										debuglog(PRIORITY_DEBUG_NORMAL,"tunnel close due to low memory condition");
+										tun_shutdown(t);
+									}
 								}
 							}
-//							if (fds[i].revents & POLLOUT){
-//								fifo_pop(&t->to_client_fifo,outbuff,&outbufflen);
-//								send(fds[i].fd, outbuff, outbufflen, 0);
-//							}
 						}
 					}
 				}
@@ -187,13 +190,174 @@ int err;
 }
 
 
+
+int pump_data(tunobj_t * tun){
+char hostbuff[1024];
+char * encoded_buf;
+uint8_t encode_buf[MAX_TRANSMIT_DATA_LENGTH+4];
+xmt_hdr_t header ;
+size_t encode_bufflen;
+fifo_t * getdata;
+
+	header.seq = tun->seq_no;
+
+
+	if (fifo_has_data(tun->to_serv_fifo)){
+		header.cmd = 'd';
+		encode_bufflen =  base64_reallen(MAX_TRANSMIT_DATA_LENGTH - ((MAX_TRANSMIT_DATA_LENGTH/MAX_DOT_DISTANCE)+1) - (strlen(tun->tun_fqdn) + 1));
+
+		if((fifo_pop(tun->to_serv_fifo,encode_buf,&encode_bufflen)) == -1){
+			debuglog(PRIORITY_DEBUG_NORMAL,"tunnel client connect failed due to memory issue");
+			return -1;
+		}
+		encoded_buf = base64_messageize(&header, encode_buf, encode_bufflen, &encode_bufflen);
+	}else{
+		header.cmd = 'p';
+		encode_bufflen = sizeof(header);
+		encoded_buf = base64_messageize(&header, NULL, 0, &encode_bufflen);
+	}
+	sprintf(hostbuff,"%c%s.%s",SIMPLE_ALPHABET[rand() % (sizeof(SIMPLE_ALPHABET) - 1)],encoded_buf,tun->tun_fqdn);
+
+	free(encoded_buf);
+
+	getdata =  internal_get_host_by_name(tun,hostbuff);
+	if (getdata){
+		if((fifo_push(tun->to_client_fifo, getdata->fifo_data, getdata->fifo_len)) == -1){
+			return -1;
+		}
+		fifo_del(getdata);
+	}
+	return 0;
+}
+
+
+void usage(char * execname){
+	printf("\nDNS pipe client usage!\n");
+	printf("%s\n", execname);
+	printf("\t-s <dns tunnel server hostname>\n");
+	printf("\t-p [<dns tunnel bind port>]\n");
+	printf("\t-d [<debug level>]\n");
+	printf("\t-l [<output log file name>]\n");
+	
+}
+
+
+void debuglog(int priority, const char *format, ...){
+time_t curr_time;
+char * timestring;
+
+va_list args;
+va_start(args, format);
+	
+	if(Server.debug_level){
+		curr_time = time(NULL);
+		timestring = ctime(&curr_time);
+		timestring[strlen(timestring)-1] = 0;
+		printf("[%s] - %s - ",timestring,LOG_LEVEL_STRS[priority]);
+		vprintf(format, args);
+		printf("\n");
+	}
+	va_end(args);
+}
+
+
+/*
+  base64 encodeing and messageizing api
+*/
+size_t base64_reallen(size_t len){
+	return ((len / 4) * 3);
+}
+
+size_t base64_length(size_t len){
+	return (((len / 3) + ((len % 3) > 0)) * 4);
+}
+
+
+
+char * base64_messageize(xmt_hdr_t * header, uint8_t *src, size_t len, size_t *out_len){
+uint8_t *inbuff;
+char * outbuff;
+size_t tmplen;
+	
+	tmplen = len + sizeof(xmt_hdr_t);
+	
+	if((inbuff = malloc(tmplen)) == NULL){
+		return NULL;
+	}
+	
+	header->len = len;
+	header->seq = htonl(header->seq);
+	memcpy(inbuff,header,sizeof(xmt_hdr_t));
+	memcpy(inbuff+sizeof(xmt_hdr_t),src,len);
+	
+	tmplen = base64_length(sizeof(xmt_hdr_t)+len);
+	
+	if((outbuff = malloc(tmplen))==NULL){
+		return NULL;
+	}
+	base64_encode(inbuff, sizeof(xmt_hdr_t)+len, outbuff, &tmplen);
+	free(inbuff);
+	return outbuff;
+	
+}
+
+char * base64_encode(uint8_t *src, size_t len, char *dst, size_t *out_len){
+char  *pos;
+uint8_t *end, *in;
+size_t dotlen;
+
+	end = src + len;
+	in = src;
+	pos = dst;
+	dotlen = 0;
+	
+	while (end - in >= 3) {
+		*pos++ = BASE64_ALPHABET[in[0] >> 2];
+		*pos++ = BASE64_ALPHABET[((in[0] & 0x03) << 4) | (in[1] >> 4)];
+		*pos++ = BASE64_ALPHABET[((in[1] & 0x0f) << 2) | (in[2] >> 6)];
+		*pos++ = BASE64_ALPHABET[in[2] & 0x3f];
+		in += 3;
+		dotlen += 4;
+		if (dotlen > MAX_DOT_DISTANCE) {
+			*pos++ = '.';
+			dotlen = 0;
+		}
+	}
+	
+	if (end - in) {
+		*pos++ = BASE64_ALPHABET[in[0] >> 2];
+		if (end - in == 1) {
+			*pos++ = BASE64_ALPHABET[(in[0] & 0x03) << 4];
+		} else {
+			*pos++ = BASE64_ALPHABET[((in[0] & 0x03) << 4) |
+								  (in[1] >> 4)];
+			*pos++ = BASE64_ALPHABET[(in[1] & 0x0f) << 2];
+		}
+		dotlen += 4;
+	}
+	
+	*pos = '\0';
+	if (out_len)
+		*out_len = pos - dst;
+	return dst;
+}
+
+/*
+ basic tunnel api
+*/
+
 tunobj_t * tun_new(server_t * server,int socket){
 tunobj_t * newtun;
 tunobj_t * t;
 	
-	newtun = calloc(1,sizeof(tunobj_t));
+	if((newtun = calloc(1,sizeof(tunobj_t))) == NULL)
+		return 0;
+	
 	newtun->tun_fqdn = strdup(server->server_host);
 	newtun->to_client_sock = socket;
+	newtun->to_serv_fifo = fifo_new();
+	newtun->to_client_fifo = fifo_new();
+	newtun->active = 1;
 	
 	if (server->phead){
 		for(t = server->phead;t->pnext;t=t->pnext);
@@ -204,6 +368,40 @@ tunobj_t * t;
 	return newtun;
 }
 
+
+void tun_shutdown(tunobj_t * tun){
+tunobj_t *t,*prev;
+char hostbuff[1024];
+char encodebuff[512];
+fifo_t * getdata;
+xmt_hdr_t header;
+char * newhostbuff;
+size_t encodebufflen = sizeof(encodebuff);
+
+	if(Server.phead){
+		for(t = Server.phead,prev= Server.phead;t;t=t->pnext){
+			if(t == tun){
+				t->active = 0;
+				header.cmd = 'x';
+				header.seq = tun->seq_no;
+				
+				debuglog(PRIORITY_DEBUG_HIGH,"close()");
+				
+				newhostbuff = base64_messageize(&header, NULL, 0, &encodebufflen);
+				sprintf(hostbuff,"%c%s.%s",SIMPLE_ALPHABET[rand() % (sizeof(SIMPLE_ALPHABET) - 1)],newhostbuff,tun->tun_fqdn);
+				free(newhostbuff);
+				if((getdata =  internal_get_host_by_name(tun,hostbuff)) != NULL){
+					debuglog(PRIORITY_DEBUG_NORMAL,"There server acknowledged the connection close request");
+					fifo_del(getdata);
+				}else{
+					debuglog(PRIORITY_DEBUG_NORMAL,"The server did not acknowledge the connection close request");
+				}
+			}
+		}
+	}
+}
+
+
 int tun_close(tunobj_t * tun){
 tunobj_t *t,*prev;
 	
@@ -211,13 +409,14 @@ tunobj_t *t,*prev;
 		for(t = Server.phead,prev= Server.phead;t;t=t->pnext){
 			if(t == tun){
 				debuglog(PRIORITY_DEBUG_HIGH, "removing connection on socket %d", t->to_client_sock);
+		
 				if(prev == Server.phead){
 					Server.phead = t->pnext;
 				}else{
 					prev->pnext = t->pnext;
 				}
-				fifo_del(&t->to_client_fifo);
-				fifo_del(&t->to_serv_fifo);
+				fifo_del(t->to_client_fifo);
+				fifo_del(t->to_serv_fifo);
 				close(t->to_client_sock);
 				free(t->tun_fqdn);
 				return 0;
@@ -232,201 +431,135 @@ tunobj_t *t,*prev;
 }
 
 
+int tun_new_session(tunobj_t * tun){
+char hostbuff[1024];
+char encodebuff[512];
+xmt_hdr_t header;
+char * newhostbuff;
+size_t encodebufflen = sizeof(encodebuff);
+fifo_t * getdata;
+
+
+	tun->seq_no = rand();
+	
+	header.cmd = 's';
+	header.seq = tun->seq_no;
+	
+	debuglog(PRIORITY_DEBUG_HIGH,"tun_new_session()");
+
+	newhostbuff = base64_messageize(&header, NULL, 0, &encodebufflen);
+	sprintf(hostbuff,"%c%s.%s",SIMPLE_ALPHABET[rand() % (sizeof(SIMPLE_ALPHABET) - 1)],newhostbuff,tun->tun_fqdn);
+
+	if((getdata =  internal_get_host_by_name(tun,hostbuff)) != NULL){
+		debuglog(PRIORITY_DEBUG_NORMAL,"proxy session create success");
+		fifo_del(getdata);
+		return 0;
+	}else{
+		debuglog(PRIORITY_DEBUG_NORMAL,"proxy session could not be created.. server did not respond");
+		return -1;
+	}
+}
 
 int tun_connect(tunobj_t * tun){
-struct sockaddr_in server_address;
-struct hostent *he;
 char hostbuff[1024];
-int trycount = 0;
-struct in_addr **addr_list;
+char encodebuff[512];
+xmt_hdr_t header;
+char * newhostbuff;
+size_t encodebufflen = sizeof(encodebuff);
+fifo_t * getdata;
+uint32_t res;
 	
-	do{
-		memset(hostbuff,0,sizeof(hostbuff));
-		sprintf(hostbuff,"c.%.8x.%s",rand(),tun->tun_fqdn);
-		debuglog(PRIORITY_DEBUG_HIGH,hostbuff);
-		he = gethostbyname(hostbuff);
-		trycount += 1;
-		if(trycount > 3){
-			break;
-		}
-	}while(he == NULL);
+	header.cmd = 'c';
+	header.seq = tun->seq_no;
+	debuglog(PRIORITY_DEBUG_HIGH,"tun_connect()");
 	
-	tun->last_heard = time(NULL);
-	addr_list = (struct in_addr **)he->h_addr_list;
-	
-	if((trycount >= 3) | (he == NULL)){
-		debuglog(PRIORITY_DEBUG_NORMAL,"packet transmission aborted due to retry limit being exceeded");
-		tun->connection_state = 0;
-		return -1;
+	newhostbuff = base64_messageize(&header, NULL, 0, &encodebufflen);
+	sprintf(hostbuff,"%c%s.%s",SIMPLE_ALPHABET[rand() % (sizeof(SIMPLE_ALPHABET) - 1)],newhostbuff,tun->tun_fqdn);
 
-	}else if (addr_list[0]->s_addr == 0){
-		tun->connection_state = 0;
-		debuglog(PRIORITY_DEBUG_NORMAL,"connect failed error %08x",addr_list[0]->s_addr );
-		return -2;
+	if((getdata =  internal_get_host_by_name(tun,hostbuff)) != NULL){
+		tun->connection_state = 1;
+		res = fifo_pop_uint32(getdata);
+		if(res > 0){
+			debuglog(PRIORITY_DEBUG_NORMAL,"connect success");
+		}else{
+			debuglog(PRIORITY_DEBUG_NORMAL,"connect failure, server reports error %d", res);
+		}
+		fifo_del(getdata);
+	}else{
+		debuglog(PRIORITY_DEBUG_NORMAL,"proxy connection could not be created.. server did not respond");
+		return -1;
 	}
-	tun->connection_state = 1;
-	tun->seq_no = ntohl(addr_list[0]->s_addr);
-	debuglog(PRIORITY_DEBUG_NORMAL,"proxy connect success");
 	return 0;
 }
 
 
-int pump_data(tunobj_t * tun){
-int i,e;
+/*
+ 	gethostbyname transport wrapper
+*/
+
+
+fifo_t * internal_get_host_by_name(tunobj_t * tun,char * hostname){
+size_t assemblylen = 0;
+uint8_t assemblybuff[3 * MAX_IPS_PER_RESPONSE];
+int trycount,i,e;
+fifo_t * fifo = NULL;
 struct hostent *he;
 struct in_addr **addr_list;
-char hostbuff[1024];
-char tchunk[1024+2];
-char * encoded_buf;
-int trycount = 0;
-uint8_t encode_buf[MAX_TRANSMIT_DATA_LENGTH+4];
-
 	
 	do{
-		if(trycount){
-			debuglog(PRIORITY_DEBUG_NORMAL,"transmission failed, retrying");
-		}
-		
-		if (fifo_has_data(&tun->to_serv_fifo)){
-			size_t outlen;
-			size_t encode_bufflen = base64_reallen(MAX_DNS_TRANSMIT_LENGTH);
-			
-			fifo_pop(&tun->to_serv_fifo,encode_buf,&encode_bufflen);
-			encoded_buf = base64_encode(encode_buf, encode_bufflen, &outlen);
-			sprintf(hostbuff, "d.%.8x.", tun->seq_no);
-			for(i=0,e=0;i<(outlen/MAX_DOT_DISTANCE);i++){
-				strncpy(tchunk,encoded_buf+(i*MAX_DOT_DISTANCE),MAX_DOT_DISTANCE);
-				tchunk[MAX_DOT_DISTANCE] = 0;
-				strcat(hostbuff,tchunk);
-				strcat(hostbuff,".");
-				e += MAX_DOT_DISTANCE;
-			}
-			if(e < outlen){
-				strcat(hostbuff,encoded_buf + (i * MAX_DOT_DISTANCE));
-				strcat(hostbuff,".");
-			}
-			strcat(hostbuff,tun->tun_fqdn);
-			free(encoded_buf);
-			
-		}else{
-			sprintf(hostbuff, "p.%.8x.%s", tun->seq_no,tun->tun_fqdn);
-		}
-		debuglog(PRIORITY_DEBUG_HIGH,"Q: %s" , hostbuff);
-		he = gethostbyname(hostbuff);
+		debuglog(PRIORITY_DEBUG_HIGH,"Q: %s" , hostname);
+		he = gethostbyname(hostname);
 		trycount += 1;
 		if(trycount > 3){
 			break;
 		}
 	}while(he == NULL);
+
 	if(he != NULL){
+		uint32_t t;
+
 		tun->last_heard = time(NULL);
 
-		size_t assemblylen = 0;
-		uint8_t assemblybuff[3 * MAX_IPS_PER_RESPONSE];
-		
 		addr_list = (struct in_addr **)he->h_addr_list;
 		
+		assemblylen = 0;
 		memset(assemblybuff,0,sizeof(assemblybuff));
-		
-		lfsr_inc_32(lfsr_taps32, &tun->seq_no);
-		
+		t =  tun->seq_no;
+		lfsr_inc(&tun->seq_no);
+		debuglog(PRIORITY_DEBUG_EXTREME, "sequence number change from %u to %u", t, tun->seq_no);
+
 		for(i = 0; addr_list[i] != NULL; i++) {
 			int tmpval = ntohl(addr_list[i]->s_addr);
 			
 			if ((ntohl(addr_list[i]->s_addr) &    0x40000000) >> 30)
-				tun->more_data_waiting = 1;
+			tun->more_data_waiting = 1;
 			
- 			assemblylen += (ntohl(addr_list[i]->s_addr) & 0x30000000) >> 28;
+			assemblylen += (ntohl(addr_list[i]->s_addr) & 0x30000000) >> 28;
 			
 			for(e=0;e<(tmpval & 0x30000000) >> 28;e++){
 				int mask = (0xff0000 >> (e * 8));
 				assemblybuff[(((tmpval & 0x0f000000) >> 24) * 3) + e] = (tmpval & mask) >> (16 - (e * 8));
 			}
 		}
-		fifo_push(&tun->to_client_fifo, assemblybuff, assemblylen);
-	}else{
-		return -2;
-	}
-	return 0;
-}
-
-
-void usage(char * execname){
-	printf("\nDNS pipe client usage!\n");
-	printf("%s\n", execname);
-	printf("\t-s <dns tunnel server hostname>\n");
-	printf("\t-p [<dns tunnel bind port>]\n");
-	printf("\t-d [<debug level>]\n");
-	printf("\t-l [<output log file name>]\n");
-
-}
-
-
-void debuglog(int priority, const char *format, ...){
-time_t curr_time;
-char * timestring;
-	
-	va_list args;
-	va_start(args, format);
-	
-	if(Server.debug_level){
-		curr_time = time(NULL);
-		timestring = ctime(&curr_time);
-		timestring[strlen(timestring)-1] = 0;
-		printf("[%s] - %s - ",timestring,LOG_LEVEL_STRS[priority]);
-		vprintf(format, args);
-		printf("\n");
-	}
-	va_end(args);
-}
-
-size_t base64_reallen(size_t len){
-	return ((len / 4) * 3);
-}
-
-size_t base64_length(size_t len){
-	return (((len / 3) + ((len % 3) > 0)) * 4);
-}
-
-char * base64_encode(uint8_t *src, size_t len, size_t *out_len){
-char  *out, *pos;
-uint8_t *end, *in;
-size_t olen;
-
-	olen = base64_length(len) + 1;
-	olen++; /* nul termination */
-	if (olen < len)
-		return NULL; /* integer overflow */
-	
-	out = malloc(olen);
-	if (out == NULL)
-		return NULL;
-	
-	end = src + len;
-	in = src;
-	pos = out;
-	
-	while ((end - in) >= 3) {
-		*pos++ = base64_table[in[0] >> 2];
-		*pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
-		*pos++ = base64_table[((in[1] & 0x0f) << 2) | (in[2] >> 6)];
-		*pos++ = base64_table[in[2] & 0x3f];
-		in += 3;
-	}
-	
-	if (end - in) {
-		*pos++ = base64_table[in[0] >> 2];
-		if (end - in == 1) {
-			*pos++ = base64_table[(in[0] & 0x03) << 4];
-		} else {
-			*pos++ = base64_table[((in[0] & 0x03) << 4) | (in[1] >> 4)];
-			*pos++ = base64_table[(in[1] & 0x0f) << 2];
+		
+		if(assemblylen){
+			fifo = fifo_new();
+			fifo_push(fifo, assemblybuff, assemblylen);
 		}
+	}else{
+		debuglog(PRIORITY_DEBUG_HIGH,"Q: query failed to reach tunnel server!");
 	}
-	
-	*pos = '\0';
-	*out_len = pos - out;
-	return out;
+	return fifo;
+}
+
+
+
+/*
+ FIFO utils
+*/
+
+fifo_t * fifo_new(){
+	return calloc(1,sizeof(fifo_t));
 }
 
 
@@ -439,37 +572,61 @@ int fifo_has_enough_data(fifo_t * fifo, size_t size){
 }
 
 void fifo_del(fifo_t * fifo){
-	
-	if(fifo->fifo_len){
-		free(fifo->fifo_data);
+	debuglog(PRIORITY_DEBUG_EXTREME,"fifo_del, len is %d",fifo->fifo_len);
+	if(fifo){
+		if(fifo->fifo_len){
+			free(fifo->fifo_data);
+		}
+		free(fifo);
+	}else{
+		debuglog(PRIORITY_DEBUG_HIGH, "null pointer passed to fifo_del, should never be the case");
 	}
 }
 
 int fifo_push(fifo_t * fifo, uint8_t * data, size_t datalen){
+	debuglog(PRIORITY_DEBUG_EXTREME,"fifo_push, len is %d before push with new datalen %d",fifo->fifo_len, datalen);
 	if(datalen){
 		if(fifo->fifo_len){
-			fifo->fifo_data = realloc(fifo->fifo_data,fifo->fifo_len + datalen);
+			if((fifo->fifo_data = realloc(fifo->fifo_data,fifo->fifo_len + datalen)))
+				return -1;
 			memmove(fifo->fifo_data+fifo->fifo_len,data,datalen);
 			fifo->fifo_len+=datalen;
 			
 		}else{
-			fifo->fifo_data = malloc(datalen);
+			if((fifo->fifo_data = malloc(datalen)) == NULL)
+				return -1;
 			memmove(fifo->fifo_data,data,datalen);
 			fifo->fifo_len=datalen;
 		}
 	}
+	debuglog(PRIORITY_DEBUG_EXTREME,"fifo_push, len is %d after push",fifo->fifo_len, datalen);
 	return 0;
 }
 
+
+uint32_t fifo_pop_uint32(fifo_t * fifo){
+uint32_t popval;
+size_t datalen  = sizeof(uint32_t);
+
+	if((fifo_pop(fifo, (uint8_t *)&popval, &datalen)) != sizeof(uint32_t)){
+		debuglog(PRIORITY_DEBUG_HIGH,"fifo did not have enough data for uint32 request, but api is bad");
+		return 0;
+	}
+	return ntohl(popval);
+}
+
+			
 size_t fifo_pop(fifo_t * fifo, uint8_t * buffer, size_t  * datalen){
 	
+	debuglog(PRIORITY_DEBUG_EXTREME,"fifo_pop, len is %d before pop",fifo->fifo_len, datalen);
 	if(*datalen){
 		if(fifo->fifo_len >= *datalen){
 			fifo->fifo_len -= *datalen;
 			memcpy(buffer,fifo->fifo_data,*datalen);
 			memmove(fifo->fifo_data, fifo->fifo_data+*datalen, fifo->fifo_len);
 			if(fifo->fifo_len){
-				fifo->fifo_data = realloc(fifo->fifo_data,fifo->fifo_len);
+				if((fifo->fifo_data = realloc(fifo->fifo_data,fifo->fifo_len)))
+					return -1;
 			}else{
 				fifo->fifo_len = 0;
 				free(fifo->fifo_data);
@@ -487,13 +644,18 @@ size_t fifo_pop(fifo_t * fifo, uint8_t * buffer, size_t  * datalen){
 			}
 		}
 	}
+	debuglog(PRIORITY_DEBUG_EXTREME,"fifo_pop, len is %d after pop",fifo->fifo_len, datalen);
 	return *datalen;
 }
 
 
+/*
+ LFSR implementation for session tracking
+*/
 
+uint32_t lfsr_inc(uint32_t *lfsr){
+	uint32_t taps[] = {0xFFFFFFFF, (1 << 31), (1 << 21), (1 << 1), (1 << 0), 0};
 
-uint32_t lfsr_inc_32(uint32_t *taps, uint32_t *lfsr){
 	uint32_t tap = 0;
 	int i = 1;
 	
